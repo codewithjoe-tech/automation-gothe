@@ -1,0 +1,21 @@
+[project]
+name = "goethe-booking-bot"
+version = "0.1.0"
+description = "Auto-books Goethe B2 exam slots the moment they open"
+requires-python = ">=3.11"
+dependencies = [
+    "undetected-chromedriver==3.5.5",
+    "selenium==4.43.0",
+    "plyer==2.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.1.1",
+]
+
+[project.scripts]
+bot = "main:run"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

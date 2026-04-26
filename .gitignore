@@ -1,7 +1,9 @@
-.venv
-chrome-profile
-docs
-.claude
+.venv/
+chrome-profile/
+docs/
+.claude/
 bot.log
 *.md
 *.pyc
+__pycache__/
+.pytest_cache/

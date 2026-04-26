@@ -1,4 +1,0 @@
-undetected-chromedriver==3.5.5
-selenium==4.43.0
-plyer==2.1.0
-pytest==8.1.1
