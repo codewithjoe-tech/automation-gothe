@@ -1,49 +1,37 @@
 # tests/test_poller.py
-from unittest.mock import MagicMock, patch
-from poller import slots_available, get_booking_links
+from unittest.mock import MagicMock
+from selenium.common.exceptions import WebDriverException
+from poller import get_select_modules_btn
 
 
-def make_driver(page_text: str) -> MagicMock:
-    """Helper: create a mock Selenium driver returning given page text."""
-    driver = MagicMock()
-    driver.page_source = page_text
-    return driver
+def _make_btn(displayed: bool):
+    btn = MagicMock()
+    btn.is_displayed.return_value = displayed
+    return btn
 
 
-def test_slots_not_available_when_no_dates_message():
-    """Returns False when the 'cannot be displayed' message is present."""
-    driver = make_driver("<p>Sorry, our dates cannot be displayed temporarily.</p>")
-    assert slots_available(driver) is False
-
-
-def test_slots_not_available_when_try_again_message():
-    """Returns False when 'try again later' is on the page."""
-    driver = make_driver("<p>Please try again later.</p>")
-    assert slots_available(driver) is False
-
-
-def test_slots_available_when_no_error_message():
-    """Returns True when neither 'no slots' message is present."""
-    driver = make_driver("<table><tr><td>2026-06-01</td><td><a href='/book'>Book</a></td></tr></table>")
-    assert slots_available(driver) is True
-
-
-def test_get_booking_links_returns_list():
-    """get_booking_links returns a list (empty or populated)."""
+def test_returns_none_when_no_buttons():
     driver = MagicMock()
     driver.find_elements.return_value = []
-    result = get_booking_links(driver)
-    assert isinstance(result, list)
+    assert get_select_modules_btn(driver) is None
 
 
-def test_get_booking_links_returns_href_and_text():
-    """get_booking_links returns dicts with 'href' and 'text' keys."""
-    mock_el = MagicMock()
-    mock_el.get_attribute.return_value = "/ins/in/en/spr/anm.cfm?city=mumbai"
-    mock_el.text = "Mumbai - 2026-06-01"
+def test_returns_none_when_all_hidden():
     driver = MagicMock()
-    driver.find_elements.return_value = [mock_el]
-    result = get_booking_links(driver)
-    assert len(result) == 1
-    assert "href" in result[0]
-    assert "text" in result[0]
+    driver.find_elements.return_value = [_make_btn(False), _make_btn(False)]
+    assert get_select_modules_btn(driver) is None
+
+
+def test_returns_first_visible_button():
+    driver = MagicMock()
+    b1 = _make_btn(False)
+    b2 = _make_btn(True)
+    b3 = _make_btn(True)
+    driver.find_elements.return_value = [b1, b2, b3]
+    assert get_select_modules_btn(driver) is b2
+
+
+def test_returns_none_on_webdriver_exception():
+    driver = MagicMock()
+    driver.find_elements.side_effect = WebDriverException("stale")
+    assert get_select_modules_btn(driver) is None

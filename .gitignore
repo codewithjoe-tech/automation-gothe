@@ -1,0 +1,7 @@
+.venv
+chrome-profile
+docs
+.claude
+bot.log
+*.md
+*.pyc

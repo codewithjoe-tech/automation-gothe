@@ -1,106 +1,77 @@
 # booker.py
-import time
 import logging
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 
-from config import (
-    CHECKBOX_SELECTORS,
-    SUBMIT_BUTTON_SELECTOR,
-    ELEMENT_TIMEOUT,
-    random_click_delay,
-)
+from config import SELECT_MODULES_SELECTOR, CHECKBOX_SELECTOR, CONTINUE_BUTTON_SELECTOR, ELEMENT_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
 
-def open_tab(driver) -> str:
-    """
-    Open a new browser tab and switch to it.
-    Returns the handle of the new tab.
-    """
-    driver.execute_script("window.open('');")
-    new_handle = driver.window_handles[-1]
-    driver.switch_to.window(new_handle)
-    return new_handle
-
-
-def check_all_boxes(driver) -> int:
-    """
-    Find all checkboxes on the page and check any that are unchecked.
-    Tries each selector in CHECKBOX_SELECTORS until boxes are found.
-    Returns the number of boxes that were clicked.
-    """
-    checkboxes = []
-    for selector in CHECKBOX_SELECTORS:
-        checkboxes = driver.find_elements(By.CSS_SELECTOR, selector)
-        if checkboxes:
-            break
-
-    clicked = 0
-    for cb in checkboxes:
-        try:
-            if not cb.is_selected():
-                time.sleep(random_click_delay())
-                cb.click()
-                clicked += 1
-        except WebDriverException as e:
-            logger.warning(f"Could not click checkbox: {e}")
-
-    logger.info(f"Checked {clicked} checkbox(es) out of {len(checkboxes)} found.")
-    return clicked
-
-
-def click_submit(driver) -> bool:
-    """
-    Find and click the submit/proceed button.
-    Returns True on success, False if not found.
-    """
+def click_select_modules(driver) -> bool:
+    """Re-find and JS-click the Select Modules button, then wait for the module-selection page."""
     try:
-        btn = driver.find_element(By.CSS_SELECTOR, SUBMIT_BUTTON_SELECTOR)
-        time.sleep(random_click_delay())
-        btn.click()
-        logger.info("Submit button clicked.")
+        # Re-query fresh — the element from poller may be stale after Vue re-renders
+        btn = WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, SELECT_MODULES_SELECTOR))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        driver.execute_script("arguments[0].click();", btn)
+        WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, CHECKBOX_SELECTOR))
+        )
+        logger.info(f"Module-selection page loaded: {driver.current_url}")
         return True
-    except NoSuchElementException:
-        logger.warning("Submit button not found — leaving tab open for manual action.")
+    except (TimeoutException, WebDriverException) as e:
+        logger.error(f"Failed to reach module-selection page: {e}")
         return False
 
 
-def book_city(driver, booking_url: str, city_label: str):
+def all_modules_available(driver) -> bool:
     """
-    Open a new tab, navigate to booking_url, check all boxes, and submit.
-    Tab stays open regardless of outcome.
+    Return True only when all 4 checkboxes (reading, listening, writing, speaking)
+    are present and none are disabled (disabled = fully booked).
     """
-    logger.info(f"Booking city: {city_label} → {booking_url}")
-    handle = open_tab(driver)
+    checkboxes = driver.find_elements(By.CSS_SELECTOR, CHECKBOX_SELECTOR)
+    if len(checkboxes) < 4:
+        logger.warning(f"Only {len(checkboxes)} checkbox(es) found — expected 4.")
+        return False
+    disabled = [cb for cb in checkboxes if cb.get_attribute("disabled")]
+    if disabled:
+        ids = [cb.get_attribute("id").strip() for cb in disabled]
+        logger.warning(f"Fully booked modules: {ids}")
+        return False
+    logger.info("All 4 modules available!")
+    return True
 
+
+def click_continue(driver) -> bool:
+    """Click the CONTINUE button. Returns True on success."""
     try:
-        driver.get(booking_url)
-        WebDriverWait(driver, ELEMENT_TIMEOUT).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        btn = WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, CONTINUE_BUTTON_SELECTOR))
         )
-        checked = check_all_boxes(driver)
-        if checked == 0:
-            logger.warning(f"No checkboxes found on {city_label} tab — manual action needed.")
-        click_submit(driver)
-    except (TimeoutException, WebDriverException) as e:
-        logger.error(f"Error booking {city_label}: {e} — tab left open.")
-
-    return handle
+        driver.execute_script("arguments[0].click();", btn)
+        logger.info(f"CONTINUE clicked → {driver.current_url}")
+        return True
+    except (TimeoutException, NoSuchElementException) as e:
+        logger.error(f"CONTINUE button not found: {e}")
+        return False
 
 
-def book_all_cities(driver, booking_links: list[dict]):
+def run_booking(driver) -> bool:
     """
-    Open one tab per booking link and run the booking flow in each.
-    Returns list of tab handles opened.
+    Full booking sequence on the existing driver:
+      1. Click 'Select Modules' (re-found fresh to avoid stale element)
+      2. Verify all 4 modules are available
+      3. Click 'Continue'
+    Returns True if Continue was clicked successfully.
     """
-    handles = []
-    for link in booking_links:
-        handle = book_city(driver, link["href"], link.get("text", link["href"]))
-        handles.append(handle)
-
-    logger.info(f"Booking complete. {len(handles)} tab(s) open at login screen.")
-    return handles
+    if not click_select_modules(driver):
+        return False
+    if not all_modules_available(driver):
+        logger.warning("Not all modules available — browser left open for manual action.")
+        return False
+    return click_continue(driver)
