@@ -1,5 +1,7 @@
 .venv/
 chrome-profile/
+chrome-profile-*/
+tor-data/
 docs/
 .claude/
 bot.log
@@ -7,3 +9,7 @@ bot.log
 *.pyc
 __pycache__/
 .pytest_cache/
+.jcode
+.env
+page_source.html
+page_screenshot.png

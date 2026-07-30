@@ -1,0 +1,8 @@
+undetected-chromedriver
+selenium
+requests
+plyer
+python-dotenv
+
+# Only needed for PROXY_MODE=tor
+# stem

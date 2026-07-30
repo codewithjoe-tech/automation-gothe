@@ -9,6 +9,14 @@ from config import SELECT_MODULES_SELECTOR, CHECKBOX_SELECTOR, CONTINUE_BUTTON_S
 
 logger = logging.getLogger(__name__)
 
+# URL fragment that identifies the "high demand" error page
+_ERROR_PAGE_MARKER = "wicket/page"
+
+
+def is_error_page(driver) -> bool:
+    """Return True if the browser is showing the 'high demand' error page."""
+    return _ERROR_PAGE_MARKER in driver.current_url
+
 
 def click_select_modules(driver) -> bool:
     """Re-find and JS-click the Select Modules button, then wait for the module-selection page."""
@@ -19,12 +27,25 @@ def click_select_modules(driver) -> bool:
         )
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
         driver.execute_script("arguments[0].click();", btn)
-        WebDriverWait(driver, ELEMENT_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, CHECKBOX_SELECTOR))
-        )
+
+        # Wait until either the checkboxes appear OR the error page loads (whichever comes first)
+        try:
+            WebDriverWait(driver, ELEMENT_TIMEOUT).until(
+                lambda d: d.find_elements(By.CSS_SELECTOR, CHECKBOX_SELECTOR) or is_error_page(d)
+            )
+        except TimeoutException:
+            pass  # fall through to the error-page check below
+
+        if is_error_page(driver):
+            logger.warning(f"'High demand' error page detected — will navigate back and retry. URL: {driver.current_url}")
+            return False
+
         logger.info(f"Module-selection page loaded: {driver.current_url}")
         return True
     except (TimeoutException, WebDriverException) as e:
+        if is_error_page(driver):
+            logger.warning(f"'High demand' error page detected (exception path). URL: {driver.current_url}")
+            return False
         logger.error(f"Failed to reach module-selection page: {e}")
         return False
 
