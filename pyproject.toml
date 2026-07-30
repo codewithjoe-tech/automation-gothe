@@ -7,6 +7,7 @@ dependencies = [
     "undetected-chromedriver==3.5.5",
     "selenium==4.43.0",
     "plyer==2.1.0",
+    "stem>=1.8.2",
 ]
 
 [dependency-groups]

@@ -151,6 +151,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "plyer" },
     { name = "selenium" },
+    { name = "stem" },
     { name = "undetected-chromedriver" },
 ]
 
@@ -163,6 +164,7 @@ dev = [
 requires-dist = [
     { name = "plyer", specifier = "==2.1.0" },
     { name = "selenium", specifier = "==4.43.0" },
+    { name = "stem", specifier = ">=1.8.2" },
     { name = "undetected-chromedriver", specifier = "==3.5.5" },
 ]
 
@@ -327,6 +329,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f233
 wheels = [
     { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
 ]
+
+[[package]]
+name = "stem"
+version = "1.8.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/c6/b2258155546f966744e78b9862f62bd2b8671b422bb9951a1330e4c8fd73/stem-1.8.2.tar.gz", hash = "sha256:83fb19ffd4c9f82207c006051480389f80af221a7e4783000aedec4e384eb582", size = 2859640, upload-time = "2023-06-06T06:37:21.251Z" }
 
 [[package]]
 name = "trio"
