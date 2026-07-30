@@ -211,8 +211,15 @@ def run_instance(
                     time.sleep(5)
                 break
 
-            # Any booking failure (error page OR modules not all available) → go back and repoll
-            log.warning("Booking did not complete — navigating back and re-polling…")
+            if success is None:
+                # Partial availability — browser is on module page, user decides manually
+                log.info(f"Instance #{idx} waiting on module page — complete manually if desired.")
+                while not stop_event.is_set():
+                    time.sleep(5)
+                break
+
+            # False — error page → go back and repoll
+            log.warning("Error page hit — navigating back and re-polling…")
             driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": _BLOCKED_URLS})
             driver.get(url)
             continue

@@ -14,8 +14,16 @@ _ERROR_PAGE_MARKER = "wicket/page"
 
 
 def is_error_page(driver) -> bool:
-    """Return True if the browser is showing the 'high demand' error page."""
-    return _ERROR_PAGE_MARKER in driver.current_url
+    """Return True if the browser hit a known bad page (high-demand or 403 Forbidden)."""
+    if _ERROR_PAGE_MARKER in driver.current_url:
+        return True
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text
+        if "Forbidden" in body or "forbidden" in body:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def click_select_modules(driver) -> bool:
@@ -82,17 +90,21 @@ def click_continue(driver) -> bool:
         return False
 
 
-def run_booking(driver) -> bool:
+def run_booking(driver):
     """
-    Full booking sequence on the existing driver:
-      1. Click 'Select Modules' (re-found fresh to avoid stale element)
-      2. Verify all 4 modules are available
-      3. Click 'Continue'
-    Returns True if Continue was clicked successfully.
+    Full booking sequence on the existing driver.
+    Returns:
+      True  — Continue clicked (all modules were available)
+      None  — partial availability; browser left on module page for user to choose manually
+      False — error page / couldn't reach module page; caller should repoll
     """
     if not click_select_modules(driver):
         return False
-    if not all_modules_available(driver):
-        logger.warning("Not all modules available — browser left open for manual action.")
+    checkboxes = driver.find_elements(By.CSS_SELECTOR, CHECKBOX_SELECTOR)
+    if not checkboxes:
+        logger.warning("No checkboxes found on module page — treating as error, will repoll.")
         return False
-    return click_continue(driver)
+    if all_modules_available(driver):
+        return click_continue(driver)
+    logger.info("Some modules unavailable — leaving browser on module page for manual selection.")
+    return None
