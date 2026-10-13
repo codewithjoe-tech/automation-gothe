@@ -1,12 +1,17 @@
 [project]
 name = "goethe-booking-bot"
-version = "0.1.0"
-description = "Auto-books Goethe B2 exam slots the moment they open"
+version = "0.2.0"
+description = "Watches a Goethe exam page and alerts you the moment slots open"
 requires-python = ">=3.11"
 dependencies = [
-    "undetected-chromedriver==3.5.5",
     "selenium==4.43.0",
     "plyer==2.1.0",
+    "python-dotenv>=1.0.0",
+    "setuptools>=70.0.0",
+    # Not used by the watcher. Required by the legacy modules kept in the tree:
+    # instance.py, capture_html.py, find_api.py (undetected-chromedriver) and
+    # tor_manager.py (stem).
+    "undetected-chromedriver==3.5.5",
     "stem>=1.8.2",
 ]
 
@@ -16,6 +21,7 @@ dev = [
 ]
 
 [project.scripts]
+watch = "main:run"
 bot = "main:run"
 
 [tool.pytest.ini_options]

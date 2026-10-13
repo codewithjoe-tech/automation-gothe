@@ -1,23 +1,33 @@
 # main.py
+"""
+Goethe B2 slot watcher.
+
+One ordinary Chrome window, signed in and parked on the exam page. The moment
+the "Select modules" button appears you get a beep, a desktop toast and
+(optionally) a push on your phone — then you book it yourself in the window
+that's already open and already logged in.
+
+Ctrl+C shuts everything down, Chrome included.
+"""
 import sys
 import os
 import time
+import signal
+import atexit
+import argparse
 import logging
-import threading
 from datetime import datetime, timedelta
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from config import (
-    INSTANCES, EXAM_URLS, OPEN_TIME,
-    PROXY_MODE,
-    DATAIMPULSE_HOST, DATAIMPULSE_PORT, DATAIMPULSE_USER, DATAIMPULSE_PASS,
-    TOR_PATH, TOR_CONTROL_PASS,
-)
-from rotating_proxy import RotatingProxyServer
-from proxy import get_working_proxies
-from instance import run_instance
+import undetected_chromedriver as uc
+from selenium.common.exceptions import WebDriverException
+
+from config import EXAM_URL, OPEN_TIME, NTFY_TOPIC, BURST_WINDOW, CHROME_VERSION
+from poller import poll_until_open
+from booker import run_booking
+from notifier import fire_alert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,10 +39,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROFILE_DIR = os.path.join(_SCRIPT_DIR, "chrome-profile")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Single live driver, so the shutdown hooks can always reach it.
+_driver = None
+_keep_browser = False
 
-def parse_open_time(raw: str) -> datetime | None:
+
+# ── Shutdown ──────────────────────────────────────────────────────────────────
+
+def shutdown() -> None:
+    """Close Chrome and its chromedriver. Safe to call more than once."""
+    global _driver
+    drv, _driver = _driver, None
+    if drv is None or _keep_browser:
+        return
+    try:
+        drv.quit()
+        logger.info("Chrome closed.")
+    except Exception:
+        # quit() can raise if Chrome already died; kill the service directly.
+        try:
+            drv.service.stop()
+        except Exception:
+            pass
+
+
+def _on_signal(signum, _frame):
+    print("\n\n  Shutting down…")
+    shutdown()
+    sys.exit(130)
+
+
+# ── Time handling ─────────────────────────────────────────────────────────────
+
+def parse_open_time(raw: str):
     for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p"):
         try:
             t = datetime.strptime(raw, fmt)
@@ -46,230 +88,188 @@ def parse_open_time(raw: str) -> datetime | None:
     return None
 
 
-def wait_until(target: datetime) -> None:
+def wait_until(target: datetime, label: str) -> None:
     while True:
         remaining = (target - datetime.now()).total_seconds()
         if remaining <= 0:
-            print(f"\r  Starting now!{' ' * 30}")
-            break
+            print(f"\r  {label} — starting now.{' ' * 30}")
+            return
         mins, secs = divmod(int(remaining), 60)
-        print(f"\r  Waiting until {target.strftime('%H:%M')} — {mins:02d}:{secs:02d} remaining…",
-              end="", flush=True)
+        hrs, mins = divmod(mins, 60)
+        print(f"\r  {label} at {target.strftime('%H:%M')} — "
+              f"{hrs:02d}:{mins:02d}:{secs:02d} remaining…", end="", flush=True)
         time.sleep(1)
 
 
-def assign_urls(urls: list[str], n: int) -> list[str]:
-    """Round-robin: 1 URL → all instances use it; N URLs → distribute evenly."""
-    if len(urls) == 1:
-        return [urls[0]] * n
-    return [urls[i % len(urls)] for i in range(n)]
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        prog="watch",
+        description="Watch a Goethe exam page and alert when slots open.",
+    )
+    p.add_argument("--url", default=None,
+                   help="Exam URL (with examId). Overrides EXAM_URL and the prompt.")
+    p.add_argument("--open-time", default=None, metavar="HH:MM",
+                   help="When slots drop. Watching starts 5 min before.")
+    p.add_argument("--no-login-wait", action="store_true",
+                   help="Skip the 'press Enter once logged in' pause.")
+    p.add_argument("--keep-browser", action="store_true",
+                   help="Leave Chrome open after Ctrl+C (default: close it).")
+    return p.parse_args(argv)
 
 
-# ── Input prompts ─────────────────────────────────────────────────────────────
-
-def _prompt_instances() -> int:
-    val = input(f"  How many browser instances? [{INSTANCES}]: ").strip()
-    if not val:
-        return INSTANCES
-    try:
-        n = int(val)
-        return max(1, n)
-    except ValueError:
-        print("  Invalid — using 1.")
-        return 1
-
-
-def _prompt_urls() -> list[str]:
-    if EXAM_URLS:
-        print(f"  URLs from .env ({len(EXAM_URLS)}): {', '.join(EXAM_URLS)}")
-        override = input("  Press Enter to use these, or paste new URLs (comma-separated): ").strip()
-        if not override:
-            return EXAM_URLS
-        raw = override
-    else:
-        raw = input("  Paste exam URL(s), comma-separated: ").strip()
-
-    urls = [u.strip() for u in raw.split(",") if u.strip()]
-    invalid = [u for u in urls if not u.startswith("http")]
-    if invalid:
-        print(f"  Invalid URLs (must start with https://): {invalid}")
+def resolve_url(args) -> str:
+    url = args.url or EXAM_URL
+    if not url:
+        url = input("  Paste the exam URL: ").strip()
+    elif not args.url:
+        val = input(f"  Exam URL [{url}]: ").strip()
+        url = val or url
+    if not url.startswith("http"):
+        print("  That doesn't look like a URL (must start with https://).")
         sys.exit(1)
-    if not urls:
-        print("  No URLs provided.")
-        sys.exit(1)
-    return urls
+    return url
 
 
-def _prompt_open_time() -> str:
-    default = OPEN_TIME or ""
-    hint = default if default else "immediate"
+def resolve_open_time(args) -> str:
+    if args.open_time is not None:
+        return args.open_time
+    hint = OPEN_TIME or "start watching immediately"
     val = input(f"  Booking opens at HH:MM (24h) [{hint}]: ").strip()
-    return val or default
+    return val or OPEN_TIME
 
 
-def _prompt_proxy_mode() -> str:
-    print(f"\n  Proxy mode from .env: {PROXY_MODE}")
-    print("  Options: none | free | dataimpulse | tor")
-    override = input("  Override proxy mode? [Enter to keep]: ").strip().lower()
-    return override if override in ("none", "free", "dataimpulse", "tor") else PROXY_MODE
+# ── Browser ───────────────────────────────────────────────────────────────────
 
-
-# ── Proxy setup ───────────────────────────────────────────────────────────────
-
-def setup_proxy(n: int, mode: str):
+def launch_browser():
     """
-    Returns (proxy_addrs, rps, tor_manager).
-    proxy_addrs[i] is the proxy string for instance i, or None for direct.
+    Stealth Chrome (undetected-chromedriver) with a persistent profile.
+
+    Persistent profile → your login and the warmed Akamai session survive
+    restarts. undetected-chromedriver → no `navigator.webdriver` flag and no
+    'controlled by automated test software' banner, which is what got the plain
+    Selenium browser 403'd. This is the single logged-in session — NOT the old
+    Tor/multi-instance stack.
     """
-    if mode == "none":
-        logger.info("Proxy: none — direct connection.")
-        return [None] * n, None, None
+    os.makedirs(_PROFILE_DIR, exist_ok=True)
 
-    if mode == "dataimpulse":
-        return _proxy_dataimpulse(n)
+    opts = uc.ChromeOptions()
+    opts.add_argument("--start-maximized")
+    opts.add_argument(f"--user-data-dir={_PROFILE_DIR}")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
 
-    if mode == "free":
-        return _proxy_free(n)
+    kwargs = {"options": opts}
+    if CHROME_VERSION:
+        kwargs["version_main"] = CHROME_VERSION
 
-    if mode == "tor":
-        return _proxy_tor(n)
-
-    logger.warning(f"Unknown proxy mode '{mode}' — direct connection.")
-    return [None] * n, None, None
-
-
-def _proxy_dataimpulse(n: int):
-    user = DATAIMPULSE_USER or input("  DataImpulse username: ").strip()
-    pwd  = DATAIMPULSE_PASS or input("  DataImpulse password: ").strip()
-    if not user or not pwd:
-        logger.warning("No DataImpulse credentials — direct connection.")
-        return [None] * n, None, None
-
-    endpoint = f"{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
-    # All instances share ONE RotatingProxyServer.
-    # DataImpulse assigns a fresh residential IP per CONNECT tunnel automatically.
-    rps = RotatingProxyServer([endpoint], auth=f"{user}:{pwd}")
-    rps.start()
-    addr = f"127.0.0.1:{rps.port}"
-    logger.info(f"DataImpulse proxy → {addr}  (upstream: {endpoint})")
-    return [addr] * n, rps, None
+    driver = uc.Chrome(**kwargs)
+    driver.implicitly_wait(0)
+    return driver
 
 
-def _proxy_free(n: int):
-    logger.info("Fetching free proxies…")
-    # Fetch enough for all instances plus spares
-    proxies = get_working_proxies(n=max(n * 3, 20), limit=150)
-    if not proxies:
-        print("  Auto-fetch failed. Paste proxies manually (ip:port, blank line to finish):")
-        proxies = []
-        while True:
-            line = input("    proxy> ").strip()
-            if not line:
-                break
-            proxies.append(line)
-
-    if not proxies:
-        logger.warning("No proxies available — direct connection.")
-        return [None] * n, None, None
-
-    rps = RotatingProxyServer(proxies)
-    rps.start()
-    addr = f"127.0.0.1:{rps.port}"
-    logger.info(f"Free proxy pool ({len(proxies)} upstreams) → {addr}")
-    return [addr] * n, rps, None
-
-
-def _proxy_tor(n: int):
-    if not TOR_PATH or not os.path.exists(TOR_PATH):
-        print(f"\n  Tor binary not found. TOR_PATH='{TOR_PATH}'")
-        print("  Download the Tor Expert Bundle from https://www.torproject.org/download/tor/")
-        print("  Then set TOR_PATH in your .env file.")
-        sys.exit(1)
-
-    from tor_manager import TorManager
-    tm = TorManager(n_instances=n, tor_path=TOR_PATH, control_pass=TOR_CONTROL_PASS)
-    try:
-        tm.start()
-    except Exception as e:
-        logger.error(f"Tor failed to start: {e}")
-        sys.exit(1)
-
-    addrs = [tm.socks_addr(i) for i in range(n)]
-    logger.info(f"Tor: {n} circuits active")
-    return addrs, None, tm
+def booking_outcome_message(result) -> str:
+    """Human-readable summary of what run_booking() did."""
+    if result is True:
+        return ("Auto-selected all modules and clicked Continue. Switch to "
+                "Chrome and FINISH the payment/login steps now.")
+    if result is None:
+        return ("Some modules were unavailable — the browser is on the module "
+                "page. Pick the modules you want manually, then continue.")
+    return ("Couldn't reach the module page — likely an Akamai block or error "
+            "page. Book manually in the Chrome window.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run():
-    print("\n" + "=" * 60)
-    print("  Goethe B2 Booking Bot  (multi-instance)")
-    print("=" * 60 + "\n")
+def run(argv=None) -> None:
+    global _driver, _keep_browser
 
-    n         = _prompt_instances()
-    urls      = _prompt_urls()
-    open_time = _prompt_open_time()
-    mode      = _prompt_proxy_mode()
+    args = parse_args(argv)
+    _keep_browser = args.keep_browser
 
-    assigned = assign_urls(urls, n)
-    proxy_addrs, rps, tor_manager = setup_proxy(n, mode)
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    atexit.register(shutdown)
 
-    logger.info(f"Launching {n} instance(s) | proxy={mode}")
-    for i in range(n):
-        logger.info(f"  [{i}] url={assigned[i]}  proxy={proxy_addrs[i] or 'direct'}")
+    print("\n" + "=" * 64)
+    print("  Goethe B2 Slot Watcher")
+    print("  Watches one page and alerts you. You do the booking.")
+    print("=" * 64 + "\n")
 
-    # Warmup: launch Chrome 30 s before open time
-    target_dt = None
-    if open_time:
-        target_dt = parse_open_time(open_time)
-        if target_dt:
-            logger.info(f"Open time: {target_dt.strftime('%H:%M')}")
-            warmup_at = target_dt - timedelta(seconds=30)
-            if warmup_at > datetime.now():
-                print(f"\nWaiting until {warmup_at.strftime('%H:%M')} to launch Chrome…")
-                wait_until(warmup_at)
-                print()
-        else:
-            logger.warning(f"Could not parse '{open_time}' — starting immediately.")
+    url = resolve_url(args)
+    open_time = resolve_open_time(args)
+    target = parse_open_time(open_time) if open_time else None
+    if open_time and target is None:
+        logger.warning(f"Couldn't parse '{open_time}' — watching immediately.")
 
-    stop_event    = threading.Event()
-    success_event = threading.Event()
-
-    threads = []
-    for i in range(n):
-        t = threading.Thread(
-            target=run_instance,
-            args=(i, assigned[i], proxy_addrs[i], stop_event, success_event, tor_manager),
-            name=f"instance-{i}",
-            daemon=True,
-        )
-        threads.append(t)
-
-    # Stagger launches by 2 s each to avoid Chrome / profile collisions
-    for i, t in enumerate(threads):
-        t.start()
-        logger.info(f"Instance {i} started.")
-        if i < n - 1:
-            time.sleep(2)
-
-    logger.info(f"All {n} instance(s) running. Press Ctrl+C to stop.")
+    push_state = "on" if NTFY_TOPIC else "off — set NTFY_TOPIC to enable"
+    ctrlc_state = "Chrome stays open" if _keep_browser else "Chrome closes too"
+    print(f"\n  Phone push: {push_state}")
+    if target:
+        print(f"  Open time:  {target.strftime('%H:%M')} "
+              f"(fast checks for {int(BURST_WINDOW)}s either side)")
+    print(f"  On Ctrl+C:  {ctrlc_state}")
+    print("  Opening Chrome…\n")
 
     try:
-        while True:
-            time.sleep(5)
-            if success_event.is_set():
-                logger.info("A slot was booked! Keep the successful Chrome window open for login.")
-    except KeyboardInterrupt:
-        logger.info("Stopping…")
-    finally:
-        stop_event.set()
-        for t in threads:
-            t.join(timeout=10)
-        if rps:
-            rps.stop()
-        if tor_manager:
-            tor_manager.stop()
-        logger.info("Done.")
+        _driver = launch_browser()
+    except WebDriverException as e:
+        logger.error(f"Chrome failed to launch: {e}")
+        sys.exit(1)
+
+    try:
+        _driver.get(url)
+    except WebDriverException as e:
+        logger.warning(f"Initial load failed ({e}) — the watcher will retry.")
+
+    if not args.no_login_wait:
+        print("\n" + "-" * 64)
+        print("  LOG IN NOW in the Chrome window that just opened.")
+        print("  A logged-in session is the single biggest speed-up there is —")
+        print("  it takes the login step off the critical path entirely.")
+        print("-" * 64)
+        input("\n  Press Enter once you're logged in and on the exam page… ")
+
+    if target:
+        watch_from = target - timedelta(minutes=5)
+        if watch_from > datetime.now():
+            print()
+            wait_until(watch_from, "Watching starts")
+            print()
+
+    poll_until_open(_driver, url, open_at=target)
+
+    # Slots open — alert, then immediately try to grab the modules in the same
+    # already-logged-in, warmed session (its Akamai cookie is the best shot at
+    # getting the automated clicks through).
+    fire_alert(url)
+    logger.info("Slots open — auto-booking in the logged-in session…")
+
+    try:
+        result = run_booking(_driver)
+    except Exception as e:
+        logger.error(f"Auto-booking raised: {e}", exc_info=True)
+        result = False
+
+    message = booking_outcome_message(result)
+    logger.info(message)
+
+    print("\n" + "=" * 64)
+    print("  SLOTS ARE OPEN — auto-booking attempted")
+    print()
+    print(f"  {message}")
+    print()
+    if not _keep_browser:
+        print("  Ctrl+C closes Chrome — don't press it mid-booking.")
+        print("  Use --keep-browser next time if you'd rather it stayed open.")
+    print("=" * 64 + "\n")
+
+    logger.info("Alert firing every 30s for 2.5 min so you can finish. Ctrl+C to stop.")
+    for _ in range(5):
+        time.sleep(30)
+        fire_alert(url)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
-undetected-chromedriver
 selenium
-requests
 plyer
 python-dotenv
+requests
 
-# Only needed for PROXY_MODE=tor
-# stem
+# Not used by the watcher — needed only by the legacy modules kept in the tree
+# (instance.py, capture_html.py, find_api.py, tor_manager.py).
+undetected-chromedriver
+stem
