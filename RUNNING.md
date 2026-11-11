@@ -1,7 +1,7 @@
 # Goethe B2 Booking Bot — How to Run
 
 ## Prerequisites
-- Python 3.10+
+- Python 3.11+
 - Google Chrome installed
 - uv installed (`pip install uv`)
 
