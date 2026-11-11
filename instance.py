@@ -64,7 +64,8 @@ def _instance_driver(idx: int) -> str | None:
     """Private copy of the patched chromedriver for instance idx."""
     if not _BASE_DRIVER:
         return None
-    dst = os.path.join(_SCRIPT_DIR, f"chromedriver-{idx}")
+    ext = os.path.splitext(_BASE_DRIVER)[1]  # ".exe" on Windows, "" elsewhere
+    dst = os.path.join(_SCRIPT_DIR, f"chromedriver-{idx}{ext}")
     if not os.path.exists(dst):
         shutil.copy2(_BASE_DRIVER, dst)
         os.chmod(dst, 0o755)
