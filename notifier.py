@@ -1,7 +1,17 @@
 # notifier.py
-import winsound
+import sys
 import time
+from types import SimpleNamespace
 from plyer import notification
+
+try:
+    import winsound
+except ImportError:  # not Windows — terminal bell instead
+    def _bell(freq: int, ms: int) -> None:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+
+    winsound = SimpleNamespace(Beep=_bell)
 
 
 def alert():
@@ -13,12 +23,15 @@ def alert():
 
 def notify_desktop(title: str, message: str):
     """Show a Windows desktop toast notification."""
-    notification.notify(
-        title=title,
-        message=message,
-        app_name="Goethe Booking Bot",
-        timeout=10,
-    )
+    try:
+        notification.notify(
+            title=title,
+            message=message,
+            app_name="Goethe Booking Bot",
+            timeout=10,
+        )
+    except Exception:  # no notification backend (e.g. no dbus) — never block booking on it
+        pass
 
 
 def fire_alert():

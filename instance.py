@@ -9,6 +9,7 @@ Each instance:
   - Sets success_event when it succeeds, then keeps the browser open for login
 """
 import os
+import shutil
 import time
 import logging
 import threading
@@ -19,7 +20,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-from booker import run_booking, is_error_page
+from booker import run_booking
 from notifier import fire_alert
 from config import CHROME_VERSION, PAGE_LOAD_TIMEOUT, SELECT_MODULES_SELECTOR
 
@@ -34,6 +35,40 @@ _BLOCKED_URLS = [
     "*linkedin.com*", "*usercentrics.eu*",
     "*ppcprotect.com*", "*/N_O5Ke/*",
 ]
+
+
+_BASE_DRIVER: str | None = None
+
+
+def prepare_chromedriver() -> str:
+    """
+    Download/patch chromedriver ONCE, before any instance starts.
+    undetected_chromedriver otherwise re-writes one shared file on every launch, which kills
+    the chromedriver another instance is running from. Each instance gets its own copy instead.
+    """
+    global _BASE_DRIVER
+    from undetected_chromedriver.patcher import Patcher
+    patcher = Patcher(version_main=CHROME_VERSION or 0)
+    patcher.auto()
+    _BASE_DRIVER = patcher.executable_path
+    for name in os.listdir(_SCRIPT_DIR):            # drop stale per-instance copies
+        if name.startswith("chromedriver-"):
+            try:
+                os.remove(os.path.join(_SCRIPT_DIR, name))
+            except OSError:
+                pass
+    return _BASE_DRIVER
+
+
+def _instance_driver(idx: int) -> str | None:
+    """Private copy of the patched chromedriver for instance idx."""
+    if not _BASE_DRIVER:
+        return None
+    dst = os.path.join(_SCRIPT_DIR, f"chromedriver-{idx}")
+    if not os.path.exists(dst):
+        shutil.copy2(_BASE_DRIVER, dst)
+        os.chmod(dst, 0o755)
+    return dst
 
 
 def _profile_dir(idx: int) -> str:
@@ -70,6 +105,9 @@ def _launch_driver(idx: int, proxy: str | None):
     kwargs = {"options": opts}
     if CHROME_VERSION:
         kwargs["version_main"] = CHROME_VERSION
+    driver_exe = _instance_driver(idx)
+    if driver_exe:
+        kwargs["driver_executable_path"] = driver_exe
 
     drv = uc.Chrome(**kwargs)
     drv.implicitly_wait(0)
@@ -103,15 +141,24 @@ def _load_page(driver, url: str, idx: int, log, tor_manager=None) -> bool:
         return False
 
 
+def _new_ip(proxy_server, log) -> None:
+    """Drop open proxy tunnels so the next request opens a new connection (= new IP)."""
+    if proxy_server:
+        n = proxy_server.drop_connections()
+        log.debug(f"Dropped {n} tunnel(s) for a fresh IP.")
+        time.sleep(0.1)  # let Chrome notice its pooled sockets are gone
+
+
 def _poll_loop(driver, url: str, idx: int, log,
                tor_manager, stop_event: threading.Event,
-               already_loaded: bool) -> bool:
+               already_loaded: bool, proxy_server=None) -> bool:
     """
     Keep refreshing until Select Modules button appears.
     Returns True when found, False when stop_event fires.
     """
     if not already_loaded:
         while not stop_event.is_set():
+            _new_ip(proxy_server, log)
             if _load_page(driver, url, idx, log, tor_manager):
                 break
             time.sleep(2)
@@ -128,6 +175,7 @@ def _poll_loop(driver, url: str, idx: int, log,
         try:
             if tor_manager:
                 tor_manager.new_circuit(idx)
+            _new_ip(proxy_server, log)
             driver.refresh()
             WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
@@ -135,6 +183,7 @@ def _poll_loop(driver, url: str, idx: int, log,
             driver.execute_script("window.stop();")
         except (TimeoutException, WebDriverException) as e:
             log.warning(f"Refresh failed: {e} — doing full load")
+            _new_ip(proxy_server, log)
             _load_page(driver, url, idx, log, tor_manager)
 
     return False  # stop_event fired
@@ -147,6 +196,7 @@ def run_instance(
     stop_event: threading.Event,
     success_event: threading.Event,
     tor_manager=None,
+    proxy_server=None,
 ) -> None:
     log = logging.getLogger(f"instance.{idx}")
     log.info(f"Starting  url={url}  proxy={proxy or 'direct'}")
@@ -181,6 +231,7 @@ def run_instance(
                 driver, url, idx, log,
                 tor_manager, stop_event,
                 already_loaded=first_attempt,
+                proxy_server=proxy_server,
             )
             first_attempt = False
 
@@ -191,7 +242,8 @@ def run_instance(
                 log.info("Another instance already booked — stopping.")
                 break
 
-            fire_alert()
+            # Background: the beeps take ~1.5 s and must not delay the booking click.
+            threading.Thread(target=fire_alert, daemon=True).start()
 
             # Re-enable full resources so checkout pages render
             driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": []})
@@ -202,30 +254,26 @@ def run_instance(
 
             if success:
                 log.info("=" * 50)
-                log.info(f"SUCCESS on instance #{idx}!")
-                log.info("Complete login manually in this Chrome window.")
+                log.info(f"MODULE PAGE REACHED on instance #{idx}!")
+                log.info("The bot is done — choose modules and continue manually in this Chrome window.")
                 log.info("=" * 50)
                 success_event.set()
-                # Stay alive while user completes manual login
+                # Stay alive while the user completes the booking by hand
                 while not stop_event.is_set():
                     time.sleep(5)
                 break
 
-            if success is None:
-                # Partial availability — browser is on module page, user decides manually
-                log.info(f"Instance #{idx} waiting on module page — complete manually if desired.")
-                while not stop_event.is_set():
-                    time.sleep(5)
-                break
-
-            # False — error page → go back and repoll
-            log.warning("Error page hit — navigating back and re-polling…")
+            # False — checkboxes not detected → back to the user's URL, repoll
+            log.warning("Checkboxes not detected — going back to the provided URL and re-polling…")
             driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": _BLOCKED_URLS})
-            driver.get(url)
+            # No driver.get here: _poll_loop (already_loaded=False) switches IP, then loads the URL.
             continue
 
     except Exception as e:
-        log.error(f"Fatal error: {e}", exc_info=True)
+        if stop_event.is_set():
+            log.info("Stopping — browser closed while a command was running.")
+        else:
+            log.error(f"Fatal error: {e}", exc_info=True)
     finally:
         try:
             driver.quit()

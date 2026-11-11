@@ -13,3 +13,4 @@ __pycache__/
 .env
 page_source.html
 page_screenshot.png
+chromedriver-*

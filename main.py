@@ -13,11 +13,13 @@ from config import (
     INSTANCES, EXAM_URLS, OPEN_TIME,
     PROXY_MODE,
     DATAIMPULSE_HOST, DATAIMPULSE_PORT, DATAIMPULSE_USER, DATAIMPULSE_PASS,
+    DATAIMPULSE_BOOKING_HOST, DATAIMPULSE_BOOKING_PORT,
+    DATAIMPULSE_BOOKING_USER, DATAIMPULSE_BOOKING_PASS, RUN_MODE,
     TOR_PATH, TOR_CONTROL_PASS,
 )
-from rotating_proxy import RotatingProxyServer
+from rotating_proxy import RotatingProxyServer, LOCAL_PORT
 from proxy import get_working_proxies
-from instance import run_instance
+from instance import run_instance, prepare_chromedriver
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,9 +116,16 @@ def _prompt_proxy_mode() -> str:
     return override if override in ("none", "free", "dataimpulse", "tor") else PROXY_MODE
 
 
+def _prompt_run_mode() -> str:
+    print(f"\n  Run mode from .env: {RUN_MODE}  (test = Residential plan, booking = Premium plan)")
+    override = input("  Run mode — test or booking? [Enter to keep]: ").strip().lower()
+    mode = override if override in ("test", "booking") else RUN_MODE
+    return mode if mode in ("test", "booking") else "test"
+
+
 # ── Proxy setup ───────────────────────────────────────────────────────────────
 
-def setup_proxy(n: int, mode: str):
+def setup_proxy(n: int, mode: str, run_mode: str = "test"):
     """
     Returns (proxy_addrs, rps, tor_manager).
     proxy_addrs[i] is the proxy string for instance i, or None for direct.
@@ -126,7 +135,7 @@ def setup_proxy(n: int, mode: str):
         return [None] * n, None, None
 
     if mode == "dataimpulse":
-        return _proxy_dataimpulse(n)
+        return _proxy_dataimpulse(n, run_mode)
 
     if mode == "free":
         return _proxy_free(n)
@@ -138,21 +147,33 @@ def setup_proxy(n: int, mode: str):
     return [None] * n, None, None
 
 
-def _proxy_dataimpulse(n: int):
-    user = DATAIMPULSE_USER or input("  DataImpulse username: ").strip()
-    pwd  = DATAIMPULSE_PASS or input("  DataImpulse password: ").strip()
-    if not user or not pwd:
-        logger.warning("No DataImpulse credentials — direct connection.")
-        return [None] * n, None, None
+def _proxy_dataimpulse(n: int, run_mode: str = "test"):
+    if run_mode == "booking":
+        user, pwd = DATAIMPULSE_BOOKING_USER, DATAIMPULSE_BOOKING_PASS
+        host, port = DATAIMPULSE_BOOKING_HOST, DATAIMPULSE_BOOKING_PORT
+        if not user or not pwd:
+            print("\n  RUN_MODE=booking needs the Premium plan credentials.")
+            print("  Set DATAIMPULSE_BOOKING_USER and DATAIMPULSE_BOOKING_PASS in .env.")
+            sys.exit(1)
+    else:
+        user = DATAIMPULSE_USER or input("  DataImpulse username: ").strip()
+        pwd  = DATAIMPULSE_PASS or input("  DataImpulse password: ").strip()
+        host, port = DATAIMPULSE_HOST, DATAIMPULSE_PORT
+        if not user or not pwd:
+            logger.warning("No DataImpulse credentials — direct connection.")
+            return [None] * n, None, None
 
-    endpoint = f"{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
-    # All instances share ONE RotatingProxyServer.
-    # DataImpulse assigns a fresh residential IP per CONNECT tunnel automatically.
-    rps = RotatingProxyServer([endpoint], auth=f"{user}:{pwd}")
-    rps.start()
-    addr = f"127.0.0.1:{rps.port}"
-    logger.info(f"DataImpulse proxy → {addr}  (upstream: {endpoint})")
-    return [addr] * n, rps, None
+    logger.info(f"DataImpulse plan: {'PREMIUM (booking)' if run_mode == 'booking' else 'test'}")
+    endpoint = f"{host}:{port}"
+    # One local proxy PER instance, so an instance can drop its own tunnels on every
+    # refresh (new connection = new DataImpulse IP) without cutting the others.
+    servers = []
+    for i in range(n):
+        srv = RotatingProxyServer([endpoint], port=LOCAL_PORT + i, auth=f"{user}:{pwd}", strict=True)
+        srv.start()
+        servers.append(srv)
+        logger.info(f"DataImpulse proxy [{i}] → 127.0.0.1:{srv.port}  (upstream: {endpoint})")
+    return [f"127.0.0.1:{s.port}" for s in servers], servers, None
 
 
 def _proxy_free(n: int):
@@ -210,9 +231,12 @@ def run():
     urls      = _prompt_urls()
     open_time = _prompt_open_time()
     mode      = _prompt_proxy_mode()
+    run_mode  = _prompt_run_mode() if mode == "dataimpulse" else "test"
 
     assigned = assign_urls(urls, n)
-    proxy_addrs, rps, tor_manager = setup_proxy(n, mode)
+    logger.info("Preparing chromedriver…")
+    prepare_chromedriver()
+    proxy_addrs, rps, tor_manager = setup_proxy(n, mode, run_mode)
 
     logger.info(f"Launching {n} instance(s) | proxy={mode}")
     for i in range(n):
@@ -239,7 +263,8 @@ def run():
     for i in range(n):
         t = threading.Thread(
             target=run_instance,
-            args=(i, assigned[i], proxy_addrs[i], stop_event, success_event, tor_manager),
+            args=(i, assigned[i], proxy_addrs[i], stop_event, success_event, tor_manager,
+                  rps[i] if isinstance(rps, list) else None),
             name=f"instance-{i}",
             daemon=True,
         )
@@ -265,8 +290,9 @@ def run():
         stop_event.set()
         for t in threads:
             t.join(timeout=10)
-        if rps:
-            rps.stop()
+        for srv in (rps if isinstance(rps, list) else [rps]):
+            if srv:
+                srv.stop()
         if tor_manager:
             tor_manager.stop()
         logger.info("Done.")

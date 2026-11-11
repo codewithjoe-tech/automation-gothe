@@ -30,6 +30,14 @@ DATAIMPULSE_PORT = int(os.getenv("DATAIMPULSE_PORT", "823"))
 DATAIMPULSE_USER = os.getenv("DATAIMPULSE_USER", "")
 DATAIMPULSE_PASS = os.getenv("DATAIMPULSE_PASS", "")
 
+# Premium plan, used when RUN_MODE=booking (DATAIMPULSE_* above is the test plan, e.g. Residential).
+# Host/port fall back to the test plan's if left blank.
+DATAIMPULSE_BOOKING_HOST = os.getenv("DATAIMPULSE_BOOKING_HOST", "").strip() or DATAIMPULSE_HOST
+DATAIMPULSE_BOOKING_PORT = int(os.getenv("DATAIMPULSE_BOOKING_PORT", "").strip() or DATAIMPULSE_PORT)
+DATAIMPULSE_BOOKING_USER = os.getenv("DATAIMPULSE_BOOKING_USER", "").strip()
+DATAIMPULSE_BOOKING_PASS = os.getenv("DATAIMPULSE_BOOKING_PASS", "").strip()
+RUN_MODE         = os.getenv("RUN_MODE", "test").lower().strip()   # test | booking
+
 # ── Tor ───────────────────────────────────────────────────────────────────────
 TOR_PATH         = os.getenv("TOR_PATH", "").strip()
 TOR_CONTROL_PASS = os.getenv("TOR_CONTROL_PASS", "").strip()

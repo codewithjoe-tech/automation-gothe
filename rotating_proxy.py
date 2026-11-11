@@ -85,8 +85,8 @@ class RotatingProxyHandler(socketserver.BaseRequestHandler):
             host, port_str = proxy.rsplit(":", 1)
             try:
                 upstream = socket.create_connection((host, int(port_str)), timeout=10)
-            except OSError:
-                server.mark_dead(proxy)
+            except OSError as e:
+                server._upstream_failed(proxy, f"connect error: {e}")
                 continue
 
             try:
@@ -109,12 +109,17 @@ class RotatingProxyHandler(socketserver.BaseRequestHandler):
                         resp += chunk
 
                     if b"200" not in resp.split(b"\r\n")[0]:
-                        server.mark_dead(proxy)
+                        status = resp.split(b"\r\n")[0].decode(errors="replace")
+                        server._upstream_failed(proxy, f"CONNECT refused: {status}")
                         upstream.close()
                         continue
 
                     self.request.sendall(resp)
-                    _tunnel(self.request, upstream)
+                    server._register(self.request, upstream)
+                    try:
+                        _tunnel(self.request, upstream)
+                    finally:
+                        server._unregister(self.request, upstream)
                 else:
                     while True:
                         chunk = upstream.recv(8192)
@@ -124,12 +129,16 @@ class RotatingProxyHandler(socketserver.BaseRequestHandler):
                     upstream.close()
 
                 return  # success
-            except OSError:
-                server.mark_dead(proxy)
+            except OSError as e:
+                server._upstream_failed(proxy, f"tunnel error: {e}")
                 try:
                     upstream.close()
                 except OSError:
                     pass
+
+        if server.strict:
+            logger.error("Upstream proxy unavailable — refusing (no direct fallback in strict mode).")
+            return
 
         # ── Fallback: direct connection (no upstream proxy) ──────────────────
         # Keeps Chrome working even when the entire pool is dead.
@@ -166,13 +175,18 @@ class RotatingProxyHandler(socketserver.BaseRequestHandler):
 
 
 class RotatingProxyServer:
-    def __init__(self, proxies: list[str], port: int = LOCAL_PORT, auth: str | None = None) -> None:
+    def __init__(self, proxies: list[str], port: int = LOCAL_PORT, auth: str | None = None,
+                 strict: bool = False) -> None:
         """
         proxies : list of "host:port" upstream proxy strings.
         auth    : optional "username:password" for authenticated upstreams
                   (e.g. DataImpulse). The credential is injected as a
                   Proxy-Authorization header on every CONNECT request.
+        strict  : paid-proxy mode. Never fall back to a direct connection, never mark the
+                  upstream dead, never pull in free public proxies — fail the request instead.
         """
+        self.strict = strict
+        self._tunnels: set = set()
         self._all: list[str] = list(proxies)
         self._dead: set[str] = set()
         self._idx: int = 0
@@ -208,6 +222,35 @@ class RotatingProxyServer:
                     added += 1
         if added:
             logger.info(f"Pool replenished +{added} proxies ({len(self.proxies)} live).")
+
+    def _register(self, *socks: socket.socket) -> None:
+        with self._lock:
+            self._tunnels.update(socks)
+
+    def _unregister(self, *socks: socket.socket) -> None:
+        with self._lock:
+            self._tunnels.difference_update(socks)
+
+    def drop_connections(self) -> int:
+        """
+        Cut every open tunnel. Chrome then has to open fresh CONNECT tunnels, and a
+        rotating upstream (DataImpulse port 823) hands out a new IP per new connection.
+        Returns the number of tunnels dropped.
+        """
+        with self._lock:
+            socks = list(self._tunnels)
+        for sock in socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)  # _tunnel sees EOF and closes both ends
+            except OSError:
+                pass
+        return len(socks) // 2
+
+    def _upstream_failed(self, proxy: str, reason: str) -> None:
+        if self.strict:
+            logger.warning(f"Upstream {proxy}: {reason}")
+        else:
+            self.mark_dead(proxy)
 
     def mark_dead(self, proxy: str) -> None:
         with self._lock:
